@@ -1,4 +1,30 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+
+# Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Runtime outputs
 data/
+outputs/
+*.log
+
+# Editor / OS metadata
+.vscode/
+.idea/
+.DS_Store
+*:Zone.Identifier
+
+# vibe-kit
+.vibe/
+.vibe/db/
+.vibe/reports/
+.vibe/locks/
+.vibe/context/LATEST_CONTEXT.md
+AGENTS.md

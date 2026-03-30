@@ -8,6 +8,7 @@ import argparse
 import base64
 import json
 import sys
+import time
 
 from .models import ExecutionPayload
 from .runner import execute_payload
@@ -20,6 +21,13 @@ def _read_text(path: str | None) -> str | None:
     if not file_path.exists():
         return None
     return file_path.read_text(encoding="utf-8", errors="replace")
+
+
+def _read_tail(path: str | None, limit_chars: int = 4000) -> str:
+    text = _read_text(path)
+    if not text:
+        return ""
+    return text[-limit_chars:]
 
 
 def _encode_image_bytes(image_bytes: bytes, *, media_type: str) -> dict[str, Any]:
@@ -85,15 +93,29 @@ def _current_observation(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _safe_segment(value: str) -> str:
+    cleaned = "".join(ch.lower() if ch.isalnum() else "-" for ch in value)
+    cleaned = cleaned.strip("-")
+    return cleaned or "session"
+
+
+def _resolve_executor_run_dir(args: argparse.Namespace, payload: dict[str, Any]) -> str:
+    metadata = dict(payload.get("metadata", {}))
+    session_id = _safe_segment(str(metadata.get("agent_session_id") or time.strftime("%Y%m%d-%H%M%S")))
+    step_id = _safe_segment(str(payload.get("step_id", "unknown-step")))
+    artifact_root = Path(args.artifact_root).resolve()
+    return str(artifact_root / session_id / step_id)
+
+
 def _handle_rpc(args: argparse.Namespace, payload: dict[str, Any]) -> dict[str, Any]:
     action = str(payload.get("action", "")).strip()
     if action == "observe":
         return {"ok": True, "action": "observe", **_current_observation(args)}
     if action == "execute":
         python_code = str(payload.get("python_code", ""))
-        run_dir = str(payload["run_dir"])
         step_id = str(payload.get("step_id", "unknown-step"))
         metadata = dict(payload.get("metadata", {}))
+        run_dir = _resolve_executor_run_dir(args, payload)
         record = execute_payload(
             ExecutionPayload(code=python_code, step_id=step_id, metadata=metadata),
             run_dir,
@@ -104,6 +126,8 @@ def _handle_rpc(args: argparse.Namespace, payload: dict[str, Any]) -> dict[str, 
             "ok": True,
             "action": "execute",
             "record": record,
+            "stdout_tail": _read_tail(record.get("stdout_path")),
+            "stderr_tail": _read_tail(record.get("stderr_path")),
             **_current_observation(args),
         }
     raise ValueError(f"unsupported action: {action!r}")
@@ -180,6 +204,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8790)
     parser.add_argument("--python-bin")
     parser.add_argument("--exec-timeout-s", type=int, default=180)
+    parser.add_argument("--artifact-root", default="data/runs")
     parser.add_argument("--screenshot-path", help="fallback image path if automatic capture fails")
     parser.add_argument("--observation-text")
     parser.add_argument("--observation-file")
