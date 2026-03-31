@@ -7,6 +7,7 @@ from typing import Any
 import argparse
 import base64
 import json
+import re
 import sys
 import time
 
@@ -107,6 +108,27 @@ def _resolve_executor_run_dir(args: argparse.Namespace, payload: dict[str, Any])
     return str(artifact_root / session_id / step_id)
 
 
+_MODULE_NOT_FOUND_RE = re.compile(r"ModuleNotFoundError:\s+No module named ['\"]([^'\"]+)['\"]")
+
+
+def _classify_execution_error(*, return_code: int, timed_out: bool, stderr_tail: str) -> dict[str, Any] | None:
+    if timed_out:
+        return {"kind": "timeout", "repairable": False}
+    if return_code == 0:
+        return None
+    match = _MODULE_NOT_FOUND_RE.search(stderr_tail or "")
+    if match:
+        module_name = match.group(1).strip()
+        install_name = module_name.split(".", 1)[0]
+        return {
+            "kind": "missing_python_module",
+            "repairable": True,
+            "module_name": module_name,
+            "install_name": install_name,
+        }
+    return None
+
+
 def _handle_rpc(args: argparse.Namespace, payload: dict[str, Any]) -> dict[str, Any]:
     action = str(payload.get("action", "")).strip()
     if action == "observe":
@@ -122,12 +144,20 @@ def _handle_rpc(args: argparse.Namespace, payload: dict[str, Any]) -> dict[str, 
             python_bin=args.python_bin,
             timeout_s=args.exec_timeout_s,
         )
+        stdout_tail = _read_tail(record.get("stdout_path"))
+        stderr_tail = _read_tail(record.get("stderr_path"))
+        error_info = _classify_execution_error(
+            return_code=int(record.get("return_code", 0)),
+            timed_out=bool(record.get("timed_out", False)),
+            stderr_tail=stderr_tail,
+        )
         return {
             "ok": True,
             "action": "execute",
             "record": record,
-            "stdout_tail": _read_tail(record.get("stdout_path")),
-            "stderr_tail": _read_tail(record.get("stderr_path")),
+            "stdout_tail": stdout_tail,
+            "stderr_tail": stderr_tail,
+            "error_info": error_info,
             **_current_observation(args),
         }
     raise ValueError(f"unsupported action: {action!r}")

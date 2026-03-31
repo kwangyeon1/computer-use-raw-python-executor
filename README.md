@@ -11,6 +11,7 @@ executor는 프롬프트 의미를 해석하지 않습니다. 프롬프트와 po
 현재 상태 응답에는 transport 내부 `screenshot_base64`가 기본으로 들어갑니다.
 `--screenshot-path`는 자동 캡처가 실패할 때만 쓰는 fallback입니다.
 실행 artifact는 agent가 보낸 경로를 그대로 쓰지 않고, executor 로컬 `--artifact-root` 아래에 저장합니다.
+실행 실패 시에는 `stdout_tail`, `stderr_tail`, `error_info`를 함께 반환하고, 현재는 `ModuleNotFoundError`만 구조화해서 분류합니다.
 
 ## 빠른 시작
 
