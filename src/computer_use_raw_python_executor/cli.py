@@ -7,8 +7,11 @@ from typing import Any
 import argparse
 import base64
 import json
+import os
 import re
+import subprocess
 import sys
+import tempfile
 import time
 
 from .models import ExecutionPayload
@@ -77,6 +80,258 @@ def _capture_screen() -> dict[str, Any]:
     }
 
 
+_OCR_SUMMARY_KEYWORDS = (
+    "download",
+    "다운로드",
+    "install",
+    "installer",
+    "setup",
+    "설치",
+    "다음",
+    "동의",
+    "확인",
+    "finish",
+    "next",
+    "save",
+    "open",
+    "exe",
+    "windows",
+    "pc",
+)
+
+
+_WINDOWS_OCR_SCRIPT = r"""
+$ErrorActionPreference = "Stop"
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+
+function Await([object] $Operation, [type] $ResultType) {
+    $asTaskMethod = [System.WindowsRuntimeSystemExtensions].GetMethods() |
+        Where-Object { $_.Name -eq 'AsTask' -and $_.IsGenericMethod -and $_.GetParameters().Count -eq 1 } |
+        Select-Object -First 1
+    if ($null -eq $asTaskMethod) {
+        throw "Could not locate System.WindowsRuntimeSystemExtensions.AsTask"
+    }
+    $asTask = $asTaskMethod.MakeGenericMethod($ResultType)
+    $netTask = $asTask.Invoke($null, @($Operation))
+    $null = $netTask.Wait(-1)
+    return $netTask.Result
+}
+
+$filePath = $env:COMPUTER_USE_OCR_IMAGE_PATH
+if ([string]::IsNullOrWhiteSpace($filePath)) {
+    throw "COMPUTER_USE_OCR_IMAGE_PATH is empty"
+}
+$null = [Windows.Storage.StorageFile, Windows.Storage, ContentType = WindowsRuntime]
+$null = [Windows.Storage.FileAccessMode, Windows.Storage, ContentType = WindowsRuntime]
+$null = [Windows.Storage.Streams.IRandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
+$null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType = WindowsRuntime]
+$null = [Windows.Graphics.Imaging.SoftwareBitmap, Windows.Graphics.Imaging, ContentType = WindowsRuntime]
+$null = [Windows.Media.Ocr.OcrEngine, Windows.Media.Ocr, ContentType = WindowsRuntime]
+$null = [Windows.Media.Ocr.OcrResult, Windows.Media.Ocr, ContentType = WindowsRuntime]
+
+$file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($filePath)) ([Windows.Storage.StorageFile])
+$stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
+$decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+$bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+if ($null -eq $engine) {
+    throw "Windows OCR engine unavailable"
+}
+$result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+
+$lines = @()
+foreach ($line in $result.Lines) {
+    $left = 2147483647
+    $top = 2147483647
+    $right = -1
+    $bottom = -1
+    foreach ($word in $line.Words) {
+        $rect = $word.BoundingRect
+        if ($rect.X -lt $left) { $left = [int]$rect.X }
+        if ($rect.Y -lt $top) { $top = [int]$rect.Y }
+        if (($rect.X + $rect.Width) -gt $right) { $right = [int]($rect.X + $rect.Width) }
+        if (($rect.Y + $rect.Height) -gt $bottom) { $bottom = [int]($rect.Y + $rect.Height) }
+    }
+    if ($right -lt $left -or $bottom -lt $top) {
+        $left = 0
+        $top = 0
+        $right = 0
+        $bottom = 0
+    }
+    $lines += @{
+        text = [string]$line.Text
+        left = [int]$left
+        top = [int]$top
+        width = [int]([Math]::Max(0, $right - $left))
+        height = [int]([Math]::Max(0, $bottom - $top))
+    }
+}
+
+@{
+    text = [string]$result.Text
+    lines = $lines
+} | ConvertTo-Json -Depth 6 -Compress
+""".strip()
+
+
+def _normalize_ocr_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip())
+
+
+def _looks_like_terminal_ocr_line(text: str) -> bool:
+    normalized = _normalize_ocr_text(text)
+    if not normalized:
+        return False
+    lowered = normalized.lower()
+    terminal_markers = (
+        ".venv",
+        "python -m",
+        "python3",
+        "pytest",
+        "compileall",
+        "powershell",
+        "cmd /c",
+        "curl ",
+        "request.json",
+        "response.json",
+        "loop-summary",
+        "run-session",
+        "return-executable-python-only-for-this-chunk",
+        "payloads/",
+        "responses/",
+        "scripts/vibe.py",
+        "computer-use-raw-python",
+    )
+    if any(marker in lowered for marker in terminal_markers):
+        return True
+    if re.search(r"--[a-z0-9][a-z0-9_-]*", lowered):
+        return True
+    if re.search(r"\bstep-\d{3}\b", lowered):
+        return True
+    if re.search(r"\b\d{8}-\d{6}\b", lowered):
+        return True
+    if re.search(r"[a-z]:\\", lowered):
+        return True
+    if normalized.count("/") + normalized.count("\\") >= 2:
+        return True
+    if any(ext in lowered for ext in (".json", ".py", ".log", ".md", ".txt")):
+        return True
+    words = re.findall(r"\S+", normalized)
+    return len(normalized) > 72 and len(words) > 7
+
+
+def _looks_like_clickable_control_text(text: str) -> bool:
+    normalized = _normalize_ocr_text(text)
+    if not normalized or _looks_like_terminal_ocr_line(normalized):
+        return False
+    words = re.findall(r"\S+", normalized)
+    return len(normalized) <= 40 and len(words) <= 6
+
+
+def _summarize_ocr_lines(lines: list[dict[str, Any]], *, max_chars: int = 420) -> str | None:
+    seen: set[str] = set()
+    normalized_lines: list[str] = []
+    for item in lines:
+        text = _normalize_ocr_text(str(item.get("text") or ""))
+        if len(text) < 2:
+            continue
+        lowered = text.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        normalized_lines.append(text)
+    if not normalized_lines:
+        return None
+
+    visible_lines = [text for text in normalized_lines if not _looks_like_terminal_ocr_line(text)]
+    if not visible_lines:
+        return None
+
+    keyword_hits = [
+        text
+        for text in visible_lines
+        if _looks_like_clickable_control_text(text)
+        and any(keyword in text.lower() for keyword in _OCR_SUMMARY_KEYWORDS)
+    ]
+    selected = keyword_hits[:6] if keyword_hits else visible_lines[:6]
+    prefix = "OCR visible text with download/install cues: " if keyword_hits else "OCR visible text: "
+    summary = prefix + " | ".join(selected)
+    if len(summary) <= max_chars:
+        return summary
+    return summary[: max_chars - 1].rstrip() + "…"
+
+
+def _powershell_candidates() -> list[str]:
+    return ["powershell.exe", "powershell", "pwsh.exe", "pwsh"]
+
+
+def _run_windows_ocr(image_path: Path) -> list[dict[str, Any]]:
+    if os.name != "nt":
+        return []
+    for executable in _powershell_candidates():
+        try:
+            env = dict(os.environ)
+            env["COMPUTER_USE_OCR_IMAGE_PATH"] = str(image_path)
+            completed = subprocess.run(
+                [
+                    executable,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    _WINDOWS_OCR_SCRIPT,
+                ],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                check=False,
+                env=env,
+                timeout=20,
+            )
+        except FileNotFoundError:
+            continue
+        except Exception:
+            return []
+        if completed.returncode != 0:
+            continue
+        try:
+            payload = json.loads(str(completed.stdout or "").strip())
+        except json.JSONDecodeError:
+            continue
+        raw_lines = payload.get("lines")
+        if isinstance(raw_lines, list):
+            return [dict(item) for item in raw_lines if isinstance(item, dict)]
+    return []
+
+
+def _observation_text_from_screenshot_payload(screenshot_payload: dict[str, Any]) -> str | None:
+    screenshot_path = str(screenshot_payload.get("screenshot_path") or "").strip()
+    temp_path: Path | None = None
+    image_path: Path | None = None
+    try:
+        if screenshot_path:
+            candidate = Path(screenshot_path)
+            if candidate.exists():
+                image_path = candidate
+        if image_path is None:
+            screenshot_base64 = str(screenshot_payload.get("screenshot_base64") or "").strip()
+            if not screenshot_base64:
+                return None
+            image_bytes = base64.b64decode(screenshot_base64)
+            with tempfile.NamedTemporaryFile(prefix="executor-ocr-", suffix=".png", delete=False) as handle:
+                handle.write(image_bytes)
+                temp_path = Path(handle.name)
+            image_path = temp_path
+        if image_path is None:
+            return None
+        return _summarize_ocr_lines(_run_windows_ocr(image_path))
+    except Exception:
+        return None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
 def _current_observation(args: argparse.Namespace) -> dict[str, Any]:
     observation_text = args.observation_text
     if args.observation_file:
@@ -87,6 +342,8 @@ def _current_observation(args: argparse.Namespace) -> dict[str, Any]:
     except Exception as exc:  # pragma: no cover - depends on host display
         capture_error = str(exc)
         screenshot_payload = _load_image_file(args.screenshot_path)
+    if not observation_text:
+        observation_text = _observation_text_from_screenshot_payload(screenshot_payload)
     return {
         **screenshot_payload,
         "observation_text": observation_text,
