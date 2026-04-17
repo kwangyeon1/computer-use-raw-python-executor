@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from computer_use_raw_python_executor.cli import _run_windows_ocr, _summarize_ocr_lines
+from computer_use_raw_python_executor.cli import (
+    _filter_ocr_lines_to_region,
+    _run_windows_ocr,
+    _screen_browser_region_fallback,
+    _summarize_ocr_lines,
+)
 
 
 def test_summarize_ocr_lines_prefers_download_install_keywords() -> None:
@@ -51,6 +56,24 @@ def test_summarize_ocr_lines_prefers_short_clickable_controls_over_terminal_nois
     assert summary is not None
     assert "다운로드" in summary
     assert ".venv" not in summary
+
+
+def test_filter_ocr_lines_to_region_keeps_only_browser_window_lines() -> None:
+    lines = [
+        {"text": "다운로드", "left": 1100, "top": 140, "width": 90, "height": 28},
+        {"text": "run-session --task", "left": 50, "top": 200, "width": 220, "height": 24},
+    ]
+    region = {"left": 400, "top": 0, "right": 1360, "bottom": 760}
+    filtered = _filter_ocr_lines_to_region(lines, region)
+    assert [item["text"] for item in filtered] == ["다운로드"]
+
+
+def test_screen_browser_region_fallback_prefers_right_side_of_screen(monkeypatch) -> None:
+    monkeypatch.setattr("computer_use_raw_python_executor.cli._screen_metrics", lambda: (1600, 900))
+    region = _screen_browser_region_fallback()
+    assert region["left"] >= 400
+    assert region["right"] <= 1590
+    assert region["bottom"] >= 860
 
 
 def test_run_windows_ocr_passes_image_path_via_environment(monkeypatch) -> None:

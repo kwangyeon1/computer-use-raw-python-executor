@@ -228,6 +228,124 @@ def _looks_like_clickable_control_text(text: str) -> bool:
     return len(normalized) <= 40 and len(words) <= 6
 
 
+def _screen_metrics() -> tuple[int, int]:
+    if os.name != "nt":
+        return (0, 0)
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    return max(1, int(user32.GetSystemMetrics(0))), max(1, int(user32.GetSystemMetrics(1)))
+
+
+def _screen_browser_region_fallback() -> dict[str, int]:
+    screen_width, screen_height = _screen_metrics()
+    left = int(screen_width * 0.26)
+    top = 0
+    right = max(left + 400, screen_width - 10)
+    bottom = max(400, screen_height - 40)
+    return {
+        "left": left,
+        "top": top,
+        "right": right,
+        "bottom": bottom,
+    }
+
+
+def _browser_window_region() -> dict[str, int] | None:
+    if os.name != "nt":
+        return None
+    try:
+        import pygetwindow as gw
+    except Exception:
+        return _screen_browser_region_fallback()
+
+    browser_title_tokens = ("chrome", "edge", "firefox", "brave", "opera", "internet explorer")
+    terminal_tokens = ("terminal", "powershell", "command prompt", "cmd", "bash", "python", "codex", "explorer")
+    active_window = None
+    try:
+        active_window = gw.getActiveWindow()
+    except Exception:
+        active_window = None
+
+    screen_width, screen_height = _screen_metrics()
+
+    def _window_score(window: object) -> int:
+        title = str(getattr(window, "title", "") or "").strip()
+        if not title:
+            return -1
+        lowered = title.lower()
+        width = int(getattr(window, "width", 0) or 0)
+        height = int(getattr(window, "height", 0) or 0)
+        left = int(getattr(window, "left", 0) or 0)
+        top = int(getattr(window, "top", 0) or 0)
+        if width < 320 or height < 320:
+            return -1
+        if left + width < 0 or top + height < 0:
+            return -1
+        score = 0
+        if any(token in lowered for token in browser_title_tokens):
+            score += 60
+        if any(token in lowered for token in ("download", "다운로드", "official", "공식", "windows", "pc")):
+            score += 15
+        if any(token in lowered for token in terminal_tokens):
+            score -= 140
+        if active_window is not None and window is active_window:
+            score += 45
+        if width >= int(screen_width * 0.45):
+            score += 35
+        if left >= int(screen_width * 0.18):
+            score += 20
+        if width < int(screen_width * 0.35) and left <= int(screen_width * 0.12):
+            score -= 35
+        if height >= int(screen_height * 0.50):
+            score += 10
+        score += min((width * height) // 50000, 30)
+        return score
+
+    candidates: list[tuple[int, object]] = []
+    for window in gw.getAllWindows():
+        score = _window_score(window)
+        if score > 0:
+            candidates.append((score, window))
+    if not candidates:
+        return _screen_browser_region_fallback()
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    _, window = candidates[0]
+    left = int(getattr(window, "left", 0) or 0)
+    top = int(getattr(window, "top", 0) or 0)
+    width = int(getattr(window, "width", 0) or 0)
+    height = int(getattr(window, "height", 0) or 0)
+    screen_width, _ = _screen_metrics()
+    if width < int(screen_width * 0.45) and left <= int(screen_width * 0.12):
+        return _screen_browser_region_fallback()
+    return {
+        "left": left,
+        "top": top,
+        "right": left + width,
+        "bottom": top + height,
+    }
+
+
+def _filter_ocr_lines_to_region(lines: list[dict[str, Any]], region: dict[str, int] | None) -> list[dict[str, Any]]:
+    if not region:
+        return list(lines)
+    filtered: list[dict[str, Any]] = []
+    left_bound = int(region.get("left", 0))
+    top_bound = int(region.get("top", 0))
+    right_bound = int(region.get("right", 0))
+    bottom_bound = int(region.get("bottom", 0))
+    for item in lines:
+        left = int(item.get("left") or 0)
+        top = int(item.get("top") or 0)
+        width = max(1, int(item.get("width") or 0))
+        height = max(1, int(item.get("height") or 0))
+        center_x = int(left + width / 2)
+        center_y = int(top + height / 2)
+        if left_bound <= center_x <= right_bound and top_bound <= center_y <= bottom_bound:
+            filtered.append(item)
+    return filtered
+
+
 def _summarize_ocr_lines(lines: list[dict[str, Any]], *, max_chars: int = 420) -> str | None:
     seen: set[str] = set()
     normalized_lines: list[str] = []
@@ -324,7 +442,10 @@ def _observation_text_from_screenshot_payload(screenshot_payload: dict[str, Any]
             image_path = temp_path
         if image_path is None:
             return None
-        return _summarize_ocr_lines(_run_windows_ocr(image_path))
+        ocr_lines = _run_windows_ocr(image_path)
+        browser_region = _browser_window_region()
+        browser_lines = _filter_ocr_lines_to_region(ocr_lines, browser_region)
+        return _summarize_ocr_lines(browser_lines or ocr_lines)
     except Exception:
         return None
     finally:
