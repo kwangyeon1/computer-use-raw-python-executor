@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 import json
+import os
 import subprocess
 import sys
 import time
@@ -41,6 +42,9 @@ def execute_payload(
     metadata_path = run_path / "execution.json"
     payload_path = run_path / "payload.json"
     interpreter = python_bin or sys.executable
+    child_env = os.environ.copy()
+    child_env.setdefault("PYTHONIOENCODING", "utf-8")
+    child_env.setdefault("PYTHONUTF8", "1")
 
     script_path.write_text(payload.code, encoding="utf-8")
     payload_path.write_text(json.dumps(payload.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -57,6 +61,7 @@ def execute_payload(
                 cwd=str(run_path),
                 stdout=stdout_handle,
                 stderr=stderr_handle,
+                env=child_env,
                 text=True,
                 timeout=timeout_s,
                 check=False,
