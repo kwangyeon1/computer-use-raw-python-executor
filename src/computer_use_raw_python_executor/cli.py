@@ -463,8 +463,6 @@ def _current_observation(args: argparse.Namespace) -> dict[str, Any]:
     except Exception as exc:  # pragma: no cover - depends on host display
         capture_error = str(exc)
         screenshot_payload = _load_image_file(args.screenshot_path)
-    if not observation_text:
-        observation_text = _observation_text_from_screenshot_payload(screenshot_payload)
     return {
         **screenshot_payload,
         "observation_text": observation_text,

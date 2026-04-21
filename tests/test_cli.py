@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 from computer_use_raw_python_executor.cli import (
+    _current_observation,
     _filter_ocr_lines_to_region,
     _run_windows_ocr,
     _screen_browser_region_fallback,
@@ -94,5 +96,32 @@ def test_run_windows_ocr_passes_image_path_via_environment(monkeypatch) -> None:
 
     assert result == [{"text": "Download", "left": 10, "top": 20, "width": 30, "height": 15}]
     assert calls
-    assert calls[0]["env"]["COMPUTER_USE_OCR_IMAGE_PATH"] == "C:/Temp/example.png"
+    assert str(calls[0]["env"]["COMPUTER_USE_OCR_IMAGE_PATH"]).replace("\\", "/") == "C:/Temp/example.png"
     assert "C:/Temp/example.png" not in calls[0]["args"]
+
+
+def test_current_observation_does_not_auto_generate_windows_ocr_summary(monkeypatch) -> None:
+    screenshot_payload = {
+        "screenshot_path": "C:/Temp/example.png",
+        "screenshot_base64": "ZmFrZQ==",
+        "screenshot_media_type": "image/png",
+    }
+    monkeypatch.setattr(
+        "computer_use_raw_python_executor.cli._capture_screen",
+        lambda: screenshot_payload,
+    )
+    monkeypatch.setattr(
+        "computer_use_raw_python_executor.cli._observation_text_from_screenshot_payload",
+        lambda payload: "OCR visible text: Download",
+    )
+
+    result = _current_observation(
+        argparse.Namespace(
+            observation_text=None,
+            observation_file=None,
+            screenshot_path=None,
+        )
+    )
+
+    assert result["observation_text"] is None
+    assert result["screenshot_base64"] == "ZmFrZQ=="
