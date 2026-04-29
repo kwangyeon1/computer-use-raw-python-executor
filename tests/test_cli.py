@@ -4,8 +4,10 @@ import argparse
 from pathlib import Path
 
 from computer_use_raw_python_executor.cli import (
+    _capture_screen,
     _current_observation,
     _filter_ocr_lines_to_region,
+    _normalize_screenshot_region,
     _run_windows_ocr,
     _screen_browser_region_fallback,
     _summarize_ocr_lines,
@@ -125,3 +127,80 @@ def test_current_observation_does_not_auto_generate_windows_ocr_summary(monkeypa
 
     assert result["observation_text"] is None
     assert result["screenshot_base64"] == "ZmFrZQ=="
+
+
+def test_capture_screen_accepts_optional_region(monkeypatch) -> None:
+    calls: list[object] = []
+
+    class FakeImage:
+        def save(self, buffer, format):  # type: ignore[no-untyped-def]
+            buffer.write(b"fake-png")
+
+    def fake_grab(*, bbox=None):
+        calls.append(bbox)
+        return FakeImage()
+
+    monkeypatch.setattr("PIL.ImageGrab.grab", fake_grab)
+
+    result = _capture_screen({"left": 10, "top": 20, "right": 110, "bottom": 220})
+
+    assert calls == [(10, 20, 110, 220)]
+    assert result["screenshot_region"] == {"left": 10, "top": 20, "right": 110, "bottom": 220}
+    assert result["screenshot_base64"]
+
+
+def test_normalize_screenshot_region_supports_installer_window_mode(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "computer_use_raw_python_executor.cli._installer_window_region",
+        lambda: {"left": 5, "top": 6, "right": 105, "bottom": 206},
+    )
+
+    assert _normalize_screenshot_region({"mode": "installer_window"}) == {
+        "left": 5,
+        "top": 6,
+        "right": 105,
+        "bottom": 206,
+    }
+
+
+def test_normalize_screenshot_region_prefers_expected_pid_window(monkeypatch) -> None:
+    calls: list[int | None] = []
+
+    def fake_pid_region(pid):
+        calls.append(pid)
+        return {"left": 20, "top": 30, "right": 420, "bottom": 330}
+
+    monkeypatch.setattr(
+        "computer_use_raw_python_executor.cli._window_region_for_process_tree",
+        fake_pid_region,
+    )
+    monkeypatch.setattr(
+        "computer_use_raw_python_executor.cli._installer_window_region",
+        lambda: {"left": 5, "top": 6, "right": 105, "bottom": 206},
+    )
+
+    assert _normalize_screenshot_region({"mode": "installer_window", "expected_pid": "1234"}) == {
+        "left": 20,
+        "top": 30,
+        "right": 420,
+        "bottom": 330,
+    }
+    assert calls == [1234]
+
+
+def test_normalize_screenshot_region_falls_back_when_expected_pid_window_missing(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "computer_use_raw_python_executor.cli._window_region_for_process_tree",
+        lambda _pid: None,
+    )
+    monkeypatch.setattr(
+        "computer_use_raw_python_executor.cli._installer_window_region",
+        lambda: {"left": 5, "top": 6, "right": 105, "bottom": 206},
+    )
+
+    assert _normalize_screenshot_region({"mode": "installer_window", "expected_pid": 1234}) == {
+        "left": 5,
+        "top": 6,
+        "right": 105,
+        "bottom": 206,
+    }
