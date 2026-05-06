@@ -18,6 +18,32 @@ from .models import ExecutionPayload
 from .runner import execute_payload
 
 
+_DPI_AWARENESS_SET = False
+
+
+def _ensure_dpi_awareness() -> None:
+    """Keep Win32 window rectangles and screenshot pixels in the same coordinate space."""
+    global _DPI_AWARENESS_SET
+    if _DPI_AWARENESS_SET or os.name != "nt":
+        return
+    _DPI_AWARENESS_SET = True
+    try:
+        import ctypes
+
+        try:
+            # Per-monitor DPI awareness gives GetWindowRect physical pixel coordinates.
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            return
+        except Exception:
+            pass
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def _read_text(path: str | None) -> str | None:
     if not path:
         return None
@@ -68,14 +94,294 @@ def _load_image_file(path: str | None) -> dict[str, Any]:
     }
 
 
-def _capture_screen() -> dict[str, Any]:
+def _installer_window_region() -> dict[str, int] | None:
+    if os.name != "nt":
+        return None
+    _ensure_dpi_awareness()
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", ctypes.c_long),
+                ("top", ctypes.c_long),
+                ("right", ctypes.c_long),
+                ("bottom", ctypes.c_long),
+            ]
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", RECT),
+                ("rcWork", RECT),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        foreground = user32.GetForegroundWindow()
+        candidates: list[tuple[int, dict[str, int]]] = []
+        shell_window = user32.GetShellWindow()
+
+        def _work_area_for_window(hwnd: int) -> RECT | None:
+            monitor = user32.MonitorFromWindow(hwnd, 2)
+            if not monitor:
+                return None
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(MONITORINFO)
+            if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                return None
+            return info.rcWork
+
+        def _add_window(hwnd: int) -> None:
+            if hwnd == shell_window or not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+                return
+            rect = RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return
+            width = int(rect.right - rect.left)
+            height = int(rect.bottom - rect.top)
+            if width < 220 or height < 140:
+                return
+            work_area = _work_area_for_window(hwnd)
+            area_ratio = 0.0
+            if work_area is not None:
+                work_width = max(1, int(work_area.right - work_area.left))
+                work_height = max(1, int(work_area.bottom - work_area.top))
+                area_ratio = (width * height) / float(work_width * work_height)
+                if area_ratio >= 0.85:
+                    return
+            score = 0
+            if hwnd == foreground:
+                score += 100
+            if area_ratio:
+                score += max(0, int(50 - abs(area_ratio - 0.20) * 100))
+            if score <= 0:
+                score = 1
+            candidates.append(
+                (
+                    score,
+                    {
+                        "left": int(rect.left),
+                        "top": int(rect.top),
+                        "right": int(rect.right),
+                        "bottom": int(rect.bottom),
+                    },
+                )
+            )
+
+        enum_proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        @enum_proc_type
+        def _enum_proc(hwnd, _lparam):
+            _add_window(int(hwnd))
+            return True
+
+        user32.EnumWindows(_enum_proc, 0)
+        if not candidates and foreground:
+            _add_window(int(foreground))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+    except Exception:
+        return None
+
+
+def _window_region_for_process_tree(expected_pid: int | None) -> dict[str, int] | None:
+    if os.name != "nt" or not expected_pid or expected_pid <= 0:
+        return None
+    _ensure_dpi_awareness()
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", ctypes.c_long),
+                ("top", ctypes.c_long),
+                ("right", ctypes.c_long),
+                ("bottom", ctypes.c_long),
+            ]
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", RECT),
+                ("rcWork", RECT),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        def _process_tree_pids(root_pid: int) -> set[int]:
+            target_pids = {int(root_pid)}
+            parent_by_pid: dict[int, int] = {}
+            snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+            invalid_snapshot = ctypes.c_void_p(-1).value
+            if snapshot in (-1, invalid_snapshot):
+                return target_pids
+            try:
+                entry = PROCESSENTRY32W()
+                entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+                if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+                    return target_pids
+                while True:
+                    parent_by_pid[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+                    if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                        break
+            finally:
+                kernel32.CloseHandle(snapshot)
+            changed = True
+            while changed:
+                changed = False
+                for pid, parent_pid in parent_by_pid.items():
+                    if pid not in target_pids and parent_pid in target_pids:
+                        target_pids.add(pid)
+                        changed = True
+            return target_pids
+
+        target_pids = _process_tree_pids(int(expected_pid))
+        foreground = user32.GetForegroundWindow()
+        shell_window = user32.GetShellWindow()
+        candidates: list[tuple[int, dict[str, int]]] = []
+
+        def _work_area_for_window(hwnd: int) -> RECT | None:
+            monitor = user32.MonitorFromWindow(hwnd, 2)
+            if not monitor:
+                return None
+            info = MONITORINFO()
+            info.cbSize = ctypes.sizeof(MONITORINFO)
+            if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                return None
+            return info.rcWork
+
+        def _add_window(hwnd: int) -> None:
+            if hwnd == shell_window or not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+                return
+            hwnd_pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(hwnd_pid))
+            process_id = int(hwnd_pid.value)
+            if process_id not in target_pids:
+                return
+            rect = RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return
+            width = int(rect.right - rect.left)
+            height = int(rect.bottom - rect.top)
+            if width < 220 or height < 140:
+                return
+            work_area = _work_area_for_window(hwnd)
+            area_ratio = 0.0
+            if work_area is not None:
+                work_width = max(1, int(work_area.right - work_area.left))
+                work_height = max(1, int(work_area.bottom - work_area.top))
+                area_ratio = (width * height) / float(work_width * work_height)
+                if area_ratio >= 0.85:
+                    return
+            score = 100
+            if process_id == int(expected_pid):
+                score += 40
+            if hwnd == foreground:
+                score += 60
+            if area_ratio:
+                score += max(0, int(50 - abs(area_ratio - 0.20) * 100))
+            candidates.append(
+                (
+                    score,
+                    {
+                        "left": int(rect.left),
+                        "top": int(rect.top),
+                        "right": int(rect.right),
+                        "bottom": int(rect.bottom),
+                    },
+                )
+            )
+
+        enum_proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        @enum_proc_type
+        def _enum_proc(hwnd, _lparam):
+            _add_window(int(hwnd))
+            return True
+
+        user32.EnumWindows(_enum_proc, 0)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+    except Exception:
+        return None
+
+
+def _coerce_expected_pid(value: Any) -> int | None:
+    try:
+        pid = int(value)
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _normalize_screenshot_region(value: Any) -> dict[str, int] | None:
+    if isinstance(value, str) and value.strip().lower() == "installer_window":
+        return _installer_window_region()
+    if not isinstance(value, dict):
+        return None
+    mode = str(value.get("mode") or "").strip().lower()
+    if mode == "installer_window":
+        expected_pid = _coerce_expected_pid(value.get("expected_pid"))
+        if expected_pid is not None:
+            pid_region = _window_region_for_process_tree(expected_pid)
+            if pid_region is not None:
+                return pid_region
+        return _installer_window_region()
+    try:
+        left = int(value.get("left"))
+        top = int(value.get("top"))
+        right = int(value.get("right"))
+        bottom = int(value.get("bottom"))
+    except (TypeError, ValueError):
+        return None
+    if right <= left or bottom <= top:
+        return None
+    return {"left": left, "top": top, "right": right, "bottom": bottom}
+
+
+def _capture_screen(region: dict[str, int] | None = None) -> dict[str, Any]:
     from PIL import ImageGrab
 
-    image = ImageGrab.grab()
+    _ensure_dpi_awareness()
+    normalized_region = _normalize_screenshot_region(region)
+    bbox = None
+    if normalized_region is not None:
+        bbox = (
+            normalized_region["left"],
+            normalized_region["top"],
+            normalized_region["right"],
+            normalized_region["bottom"],
+        )
+    image = ImageGrab.grab(bbox=bbox)
     buffer = BytesIO()
     image.save(buffer, format="PNG")
     return {
         "screenshot_path": None,
+        "screenshot_region": normalized_region,
         **_encode_image_bytes(buffer.getvalue(), media_type="image/png"),
     }
 
@@ -453,16 +759,17 @@ def _observation_text_from_screenshot_payload(screenshot_payload: dict[str, Any]
             temp_path.unlink(missing_ok=True)
 
 
-def _current_observation(args: argparse.Namespace) -> dict[str, Any]:
+def _current_observation(args: argparse.Namespace, *, screenshot_region: dict[str, Any] | None = None) -> dict[str, Any]:
     observation_text = args.observation_text
     if args.observation_file:
         observation_text = _read_text(args.observation_file)
     capture_error = None
     try:
-        screenshot_payload = _capture_screen()
+        screenshot_payload = _capture_screen(screenshot_region)
     except Exception as exc:  # pragma: no cover - depends on host display
         capture_error = str(exc)
         screenshot_payload = _load_image_file(args.screenshot_path)
+        screenshot_payload.setdefault("screenshot_region", None)
     return {
         **screenshot_payload,
         "observation_text": observation_text,
@@ -508,7 +815,7 @@ def _classify_execution_error(*, return_code: int, timed_out: bool, stderr_tail:
 def _handle_rpc(args: argparse.Namespace, payload: dict[str, Any]) -> dict[str, Any]:
     action = str(payload.get("action", "")).strip()
     if action == "observe":
-        return {"ok": True, "action": "observe", **_current_observation(args)}
+        return {"ok": True, "action": "observe", **_current_observation(args, screenshot_region=payload.get("screenshot_region"))}
     if action == "execute":
         python_code = str(payload.get("python_code", ""))
         step_id = str(payload.get("step_id", "unknown-step"))
@@ -534,7 +841,7 @@ def _handle_rpc(args: argparse.Namespace, payload: dict[str, Any]) -> dict[str, 
             "stdout_tail": stdout_tail,
             "stderr_tail": stderr_tail,
             "error_info": error_info,
-            **_current_observation(args),
+            **_current_observation(args, screenshot_region=payload.get("screenshot_region")),
         }
     raise ValueError(f"unsupported action: {action!r}")
 
